@@ -156,7 +156,41 @@ func ParseMessage(data []byte) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Message{}, nil
+	p := &parser{data: data, off: 12}
+	m := &Message{Header: h}
+
+	for i := 0; i < int(h.QDCount); i++ {
+		q, err := p.readQuestion()
+		if err != nil {
+			return nil, err
+		}
+		m.Questions = append(m.Questions, q)
+	}
+
+	for i := 0; i < int(h.ANCount); i++ {
+		rr, err := p.readResourceRecord()
+		if err != nil {
+			return nil, err
+		}
+		m.Answers = append(m.Answers, rr)
+	}
+
+	for i := 0; i < int(h.NSCount); i++ {
+		rr, err := p.readResourceRecord()
+		if err != nil {
+			return nil, err
+		}
+		m.Authorities = append(m.Authorities, rr)
+	}
+	for i := 0; i < int(h.ARCount); i++ {
+		rr, err := p.readResourceRecord()
+		if err != nil {
+			return nil, err
+		}
+		m.Additionals = append(m.Additionals, rr)
+	}
+
+	return m, nil
 }
 
 type parser struct {
@@ -325,6 +359,10 @@ func main() {
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
 
 		message, err := ParseMessage(buf[:size])
+		if err != nil {
+			fmt.Println("something went wrong parsing message, %w", err)
+		}
+
 		var responseCode uint8 = 0
 
 		if message.Header.Opcode != 0 {
