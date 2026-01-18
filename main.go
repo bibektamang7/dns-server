@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -9,20 +10,25 @@ import (
 )
 
 type Query struct {
-	Header   Header
-	Question Question
-	Answers  []ResourceRecord
+	Header    Header
+	Questions []*Question
+	Answers   []*ResourceRecord
 }
 
 func (q *Query) Encode() []byte {
+	buf := []byte{}
 	headerBytes := q.Header.Encode()
-	questionBytes := q.Question.Encode()
-	answerBytes := []byte{}
-	for _, ans := range q.Answers {
-		answerBytes = append(answerBytes, ans.Encode()...)
+	buf = append(buf, headerBytes...)
+
+	offsetMap := map[string]int{}
+
+	for _, question := range q.Questions {
+		question.Encode(&buf, offsetMap)
 	}
-	hq := append(headerBytes, questionBytes...)
-	return append(hq, answerBytes...)
+	for _, ans := range q.Answers {
+		ans.Encode(&buf, offsetMap)
+	}
+	return buf
 }
 
 type ResourceRecord struct {
@@ -33,34 +39,17 @@ type ResourceRecord struct {
 	RData []byte
 }
 
-func (rr *ResourceRecord) Encode() []byte {
-	var buf []byte
-	for _, label := range strings.Split(rr.Name, ".") {
-		buf = append(buf, byte(len(label)))
-		buf = append(buf, []byte(label)...)
-	}
+func (rr *ResourceRecord) Encode(buf *[]byte, offsetMap map[string]int) {
+	encodeName(rr.Name, buf, offsetMap)
 
-	buf = append(buf, 0x00)
+	tmp := make([]byte, 10)
+	binary.BigEndian.PutUint16(tmp[0:2], rr.Type)
+	binary.BigEndian.PutUint16(tmp[2:4], rr.Class)
+	binary.BigEndian.PutUint32(tmp[4:8], rr.TTL)
+	binary.BigEndian.PutUint16(tmp[8:10], uint16(len(rr.RData)))
 
-	t := make([]byte, 2)
-	binary.BigEndian.PutUint16(t, rr.Type)
-	buf = append(buf, t...)
-
-	c := make([]byte, 2)
-	binary.BigEndian.PutUint16(c, rr.Class)
-	buf = append(buf, c...)
-
-	ttl := make([]byte, 4)
-	binary.BigEndian.PutUint32(ttl, rr.TTL)
-	buf = append(buf, ttl...)
-
-	rdlen := make([]byte, 2)
-	binary.BigEndian.PutUint16(rdlen, uint16(len(rr.RData)))
-	buf = append(buf, rdlen...)
-
-	buf = append(buf, rr.RData...)
-
-	return buf
+	*buf = append(*buf, tmp...)
+	*buf = append(*buf, rr.RData...)
 }
 
 type Encoder interface {
@@ -73,14 +62,36 @@ type Question struct {
 	QClass uint16
 }
 
-func (q *Question) Encode() []byte {
-	var buf []byte
-
-	for _, label := range strings.Split(q.Name, ".") {
-		buf = append(buf, byte(len(label)))
-		buf = append(buf, []byte(label)...)
+func encodeName(name string, buf *[]byte, offsetMap map[string]int) {
+	if name == "" {
+		*buf = append(*buf, 0)
+		return
 	}
-	buf = append(buf, 0x00)
+
+	labels := strings.Split(name, ".")
+	for i := 0; i < len(labels); i++ {
+		suffix := strings.Join(labels[i:], ".")
+		if pos, ok := offsetMap[suffix]; ok {
+			pointer := 0xC000 | pos
+			p := make([]byte, 2)
+			binary.BigEndian.PutUint16(p, uint16(pointer))
+			*buf = append(*buf, p...)
+			return
+		}
+
+		offsetMap[suffix] = len(*buf)
+		label := labels[i]
+
+		*buf = append(*buf, byte(len(label)))
+		*buf = append(*buf, []byte(label)...)
+	}
+
+	*buf = append(*buf, 0)
+}
+
+func (q *Question) Encode(buf *[]byte, offsetMap map[string]int) {
+
+	encodeName(q.Name, buf, offsetMap)
 
 	qType := make([]byte, 2)
 	qClass := make([]byte, 2)
@@ -88,10 +99,9 @@ func (q *Question) Encode() []byte {
 	binary.BigEndian.PutUint16(qType, q.QType)
 	binary.BigEndian.PutUint16(qClass, q.QClass)
 
-	buf = append(buf, qType...)
-	buf = append(buf, qClass...)
+	*buf = append(*buf, qType...)
+	*buf = append(*buf, qClass...)
 
-	return buf
 }
 
 type Header struct {
@@ -280,14 +290,23 @@ func (p *parser) readResourceRecord() (*ResourceRecord, error) {
 }
 
 func (p *parser) readName() (string, error) {
+	return p.readNameWithJumps(make(map[int]bool))
+}
+
+func (p *parser) readNameWithJumps(visited map[int]bool) (string, error) {
 	var labels []string
 
-	start := p.off
-	jumped := false
+	originalOff := p.off // for the sake of compression!
+
+	jumped := false // track if we've followed a pointer
 
 	for {
 		if p.off >= len(p.data) {
 			return "", fmt.Errorf("name out of range")
+		}
+
+		if visited[p.off] {
+			return "", fmt.Errorf("compression loop detected at offset %d", p.off)
 		}
 		length := int(p.data[p.off])
 		p.off++
@@ -299,18 +318,30 @@ func (p *parser) readName() (string, error) {
 			ptr := ((length & 0x3F) << 8) | int(p.data[p.off])
 			p.off++
 
+			if ptr >= len(p.data) {
+				return "", fmt.Errorf("pointer out of range %d", ptr)
+			}
+
+			visited[originalOff] = true
+
 			sub := &parser{data: p.data, off: ptr}
-			name, err := sub.readName()
+			name, err := sub.readNameWithJumps(visited)
 			if err != nil {
 				return "", err
 			}
-			labels = append(labels, name)
+
+			if name != "" {
+				labels = append(labels, name)
+			}
 
 			if !jumped {
-				start = p.off
+				jumped = true // mark that we've followed a pointer
 			}
-			jumped = true
-			break
+			break //compression pointer always terminates current label sequence
+		}
+
+		if length > 63 {
+			return "", fmt.Errorf("label too long %d", length)
 		}
 		if length == 0 {
 			break // terminator case
@@ -324,16 +355,32 @@ func (p *parser) readName() (string, error) {
 		labels = append(labels, label)
 	}
 
-	if jumped {
-		p.off = start
-	}
-
 	return strings.Join(labels, "."), nil
 
 }
 
+func answerQuestion(q *Question) *ResourceRecord {
+	return &ResourceRecord{
+		Name:  q.Name,
+		Type:  1,
+		Class: 1,
+		TTL:   60,
+		RData: []byte{8, 8, 8, 8},
+	}
+}
+
 func main() {
 	fmt.Println("Logs from your program will appear here!")
+	addr := flag.String("resolver", "", "The address of DNS resolver to use")
+
+	flag.Parse()
+
+	resAddr, err := net.ResolveUDPAddr("udp", *addr)
+	if err != nil {
+		fmt.Println("failed to resolve resolver address UDP")
+		return
+	}
+
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:2053")
 	if err != nil {
 		log.Fatal(err)
@@ -369,6 +416,90 @@ func main() {
 			responseCode = 4
 		}
 
+		if resAddr != nil && responseCode == 0 {
+			var allAnswers []*ResourceRecord
+
+			for _, question := range message.Questions {
+				singleQuery := Query{
+					Header: Header{
+						ID:      message.Header.ID,
+						QR:      false,
+						Opcode:  message.Header.Opcode,
+						AA:      false,
+						TC:      false,
+						RD:      message.Header.RD,
+						RA:      false,
+						Z:       0,
+						RCode:   0,
+						QDCount: 1,
+						ANCount: 0,
+						NSCount: 0,
+						ARCount: 0,
+					},
+					Questions: []*Question{question},
+					Answers:   []*ResourceRecord{},
+				}
+				quryData := singleQuery.Encode()
+
+				conn, err := net.DialUDP("udp", nil, resAddr)
+				if err != nil {
+					fmt.Println("failed to dial resolver")
+				}
+
+				_, err = conn.Write(quryData)
+				if err != nil {
+					fmt.Println("unable to send query to resolver")
+					conn.Close()
+					continue
+				}
+
+				responseData := make([]byte, 512)
+				n, err := conn.Read(responseData)
+
+				conn.Close()
+				if err != nil {
+					fmt.Println("failed to read from connection")
+					continue
+				}
+
+				ressolverResponse , err := ParseMessage(responseData[:n])
+				if err != nil {
+					fmt.Println("failed to parse messsage")
+					continue
+				}
+
+				allAnswers = append(allAnswers, ressolverResponse.Answers...)
+
+			}
+
+			finalResponse := Query {
+				Header: Header{
+					ID: message.Header.ID,
+					QR: true,
+					Opcode: message.Header.Opcode,
+					AA: false,
+					TC: false, 
+					RD: message.Header.RD,
+					RA: true,
+					Z:0,
+					RCode: 0,
+					QDCount: uint16(len(message.Questions)),
+					ANCount: uint16(len(allAnswers)),
+					NSCount: 0,
+					ARCount: 0,
+				},
+				Questions: message.Questions,
+				Answers: allAnswers,
+			}
+			responseBytes := finalResponse.Encode()
+			_, err := udpConn.WriteToUDP(responseBytes, source)
+
+			if err != nil {
+				fmt.Println("failed to write response to source")
+			}
+			continue
+		}
+
 		header := Header{
 			ID:      message.Header.ID,
 			QR:      true,
@@ -378,31 +509,36 @@ func main() {
 			RD:      message.Header.RD,
 			RA:      false,
 			Z:       0,
-			RCode:   message.Header.RCode,
-			QDCount: 1,
-			ANCount: 1,
+			RCode:   responseCode,
+			QDCount: uint16(len(message.Questions)),
+			ANCount: uint16(len(message.Questions)),
 			NSCount: 0,
 			ARCount: 0,
 		}
 
-		answer := ResourceRecord{
-			Name:  "codecrafters.io",
-			Type:  1,
-			Class: 1,
-			TTL:   60,
-			RData: []byte{8, 8, 8, 8},
-		}
+		// 	Name:  message.Questions[0].Name,
+		// 	Type:  1,
+		// 	Class: 1,
+		// 	TTL:   60,
+		// 	RData: []byte{8, 8, 8, 8},
+		// }
+		//
+		// question := Question{
+		// 	Name:   message.Questions[0].Name,
+		// 	QType:  1,
+		// 	QClass: 1,
+		// }
 
-		question := Question{
-			Name:   "codecrafters.io",
-			QType:  1,
-			QClass: 1,
+		answers := []*ResourceRecord{}
+		for _, question := range message.Questions {
+			answer := answerQuestion(question)
+			answers = append(answers, answer)
 		}
 
 		query := Query{
-			Header:   header,
-			Question: question,
-			Answers:  []ResourceRecord{answer},
+			Header:    header,
+			Questions: message.Questions,
+			Answers:   answers,
 		}
 
 		response := query.Encode()
