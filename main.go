@@ -11,12 +11,56 @@ import (
 type Query struct {
 	Header   Header
 	Question Question
+	Answers  []ResourceRecord
 }
 
 func (q *Query) Encode() []byte {
 	headerBytes := q.Header.Encode()
 	questionBytes := q.Question.Encode()
-	return append(headerBytes, questionBytes...)
+	answerBytes := []byte{}
+	for _, ans := range q.Answers {
+		answerBytes = append(answerBytes, ans.Encode()...)
+	}
+	hq := append(headerBytes, questionBytes...)
+	return append(hq, answerBytes...)
+}
+
+type ResourceRecord struct {
+	Name  string
+	Type  uint16
+	Class uint16
+	TTL   uint32
+	RData []byte
+}
+
+func (rr *ResourceRecord) Encode() []byte {
+	var buf []byte
+	for _, label := range strings.Split(rr.Name, ".") {
+		buf = append(buf, byte(len(label)))
+		buf = append(buf, []byte(label)...)
+	}
+
+	buf = append(buf, 0x00)
+
+	t := make([]byte, 2)
+	binary.BigEndian.PutUint16(t, rr.Type)
+	buf = append(buf, t...)
+
+	c := make([]byte, 2)
+	binary.BigEndian.PutUint16(c, rr.Class)
+	buf = append(buf, c...)
+
+	ttl := make([]byte, 2)
+	binary.BigEndian.PutUint32(ttl, rr.TTL)
+	buf = append(buf, ttl...)
+
+	rdlen := make([]byte, 2)
+	binary.BigEndian.PutUint16(rdlen, uint16(len(rr.RData)))
+	buf = append(buf, rdlen...)
+
+	buf = append(buf, rr.RData...)
+
+	return buf
 }
 
 type Encoder interface {
@@ -140,6 +184,14 @@ func main() {
 			ARCount: 0,
 		}
 
+		answer := ResourceRecord{
+			Name:  "codecrafters.io",
+			Type:  1,
+			Class: 1,
+			TTL:   60,
+			RData: []byte{8, 8, 8, 8},
+		}
+
 		question := Question{
 			Name:   "codecrafters.io",
 			QType:  1,
@@ -149,6 +201,7 @@ func main() {
 		query := Query{
 			Header:   header,
 			Question: question,
+			Answers: []ResourceRecord{answer},
 		}
 
 		response := query.Encode()
