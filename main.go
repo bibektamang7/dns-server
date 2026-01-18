@@ -124,8 +124,35 @@ func main() {
 		}
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
+		header := Header{
+			ID:      1234,
+			QR:      true,
+			Opcode:  0,
+			AA:      false,
+			TC:      false,
+			RD:      false,
+			RA:      false,
+			Z:       0,
+			RCode:   0,
+			QDCount: 1,
+			ANCount: 1,
+			NSCount: 0,
+			ARCount: 0,
+		}
 
-		response := []byte{}
+		question := Question{
+			Name:   "codecrafters.io",
+			QType:  1,
+			QClass: 1,
+		}
+
+		query := Query{
+			Header:   header,
+			Question: question,
+		}
+
+		response := query.Encode()
+
 		_, err = udpConn.WriteToUDP(response, source)
 
 		if err != nil {
