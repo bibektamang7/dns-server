@@ -50,7 +50,7 @@ func (rr *ResourceRecord) Encode() []byte {
 	binary.BigEndian.PutUint16(c, rr.Class)
 	buf = append(buf, c...)
 
-	ttl := make([]byte, 2)
+	ttl := make([]byte, 4)
 	binary.BigEndian.PutUint32(ttl, rr.TTL)
 	buf = append(buf, ttl...)
 
@@ -143,6 +143,71 @@ func (h *Header) Encode() []byte {
 	return buf
 }
 
+type Message struct {
+	Header      *Header
+	Questions   []*Question
+	Answers     []*ResourceRecord
+	Authorities []*ResourceRecord
+	Additionals []*ResourceRecord
+}
+
+func ParseMessage(data []byte) (*Message, error) {
+	h, err := parseHeader(data)
+	if err != nil {
+		return nil, err
+	}
+	return &Message{}, nil
+}
+
+type parser struct {
+	data []byte
+	off  int
+}
+
+func (p *parser) readByte() byte {
+	b := p.data[p.off]
+	p.off++
+	return b
+}
+
+func (p *parser) readUint16() uint16 {
+	v := binary.BigEndian.Uint16(p.data[p.off:])
+	p.off += 2
+	return v
+}
+
+func (p *parser) readUint32() uint32 {
+	v := binary.BigEndian.Uint32(p.data[p.off:])
+	p.off += 4
+	return v
+}
+
+func parseHeader(data []byte) (*Header, error) {
+	if len(data) < 12 {
+		return nil, fmt.Errorf("too short for DNS header")
+	}
+
+	h := &Header{}
+	h.ID = binary.BigEndian.Uint16(data[0:2])
+	flags := binary.BigEndian.Uint16(data[2:4])
+	h.QR = (flags >> 15) & 1 == 1
+	h.Opcode = uint8((flags >> 11) & 0xF)
+	h.AA = (flags >> 10) & 1 == 1
+	h.TC= (flags >> 9) & 1 == 1
+	h.RD = (flags >> 8) & 1 == 1
+	h.RA = (flags >> 7) & 1 == 1
+	h.Z = uint8((flags >> 4) & 0x7)
+	h.RCode = uint8(flags & 0xF)
+
+	h.QDCount = binary.BigEndian.Uint16(data[4:6])
+	h.ANCount = binary.BigEndian.Uint16(data[6:8])
+	h.NSCount = binary.BigEndian.Uint16(data[8:10])
+	h.ARCount= binary.BigEndian.Uint16(data[10:12])
+
+	return h, nil
+}
+
+
 func main() {
 	fmt.Println("Logs from your program will appear here!")
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:2053")
@@ -168,16 +233,24 @@ func main() {
 		}
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
+
+		message, err := ParseMessage(buf[:size])
+		var responseCode uint8 = 0
+
+		if message.Header.Opcode != 0 {
+			responseCode = 4
+		}
+
 		header := Header{
-			ID:      1234,
+			ID:      message.Header.ID,
 			QR:      true,
-			Opcode:  0,
+			Opcode:  message.Header.Opcode,
 			AA:      false,
 			TC:      false,
-			RD:      false,
+			RD:      message.Header.RD,
 			RA:      false,
 			Z:       0,
-			RCode:   0,
+			RCode:   message.Header.RCode,
 			QDCount: 1,
 			ANCount: 1,
 			NSCount: 0,
@@ -201,7 +274,7 @@ func main() {
 		query := Query{
 			Header:   header,
 			Question: question,
-			Answers: []ResourceRecord{answer},
+			Answers:  []ResourceRecord{answer},
 		}
 
 		response := query.Encode()
