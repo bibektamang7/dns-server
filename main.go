@@ -190,23 +190,113 @@ func parseHeader(data []byte) (*Header, error) {
 	h := &Header{}
 	h.ID = binary.BigEndian.Uint16(data[0:2])
 	flags := binary.BigEndian.Uint16(data[2:4])
-	h.QR = (flags >> 15) & 1 == 1
+	h.QR = (flags>>15)&1 == 1
 	h.Opcode = uint8((flags >> 11) & 0xF)
-	h.AA = (flags >> 10) & 1 == 1
-	h.TC= (flags >> 9) & 1 == 1
-	h.RD = (flags >> 8) & 1 == 1
-	h.RA = (flags >> 7) & 1 == 1
+	h.AA = (flags>>10)&1 == 1
+	h.TC = (flags>>9)&1 == 1
+	h.RD = (flags>>8)&1 == 1
+	h.RA = (flags>>7)&1 == 1
 	h.Z = uint8((flags >> 4) & 0x7)
 	h.RCode = uint8(flags & 0xF)
 
 	h.QDCount = binary.BigEndian.Uint16(data[4:6])
 	h.ANCount = binary.BigEndian.Uint16(data[6:8])
 	h.NSCount = binary.BigEndian.Uint16(data[8:10])
-	h.ARCount= binary.BigEndian.Uint16(data[10:12])
+	h.ARCount = binary.BigEndian.Uint16(data[10:12])
 
 	return h, nil
 }
 
+func (p *parser) readQuestion() (*Question, error) {
+	name, err := p.readName()
+	if err != nil {
+		return nil, err
+	}
+
+	return &Question{
+		Name:   name,
+		QType:  p.readUint16(),
+		QClass: p.readUint16(),
+	}, nil
+
+}
+
+func (p *parser) readResourceRecord() (*ResourceRecord, error) {
+	name, err := p.readName()
+	if err != nil {
+		return nil, err
+	}
+
+	rr := &ResourceRecord{
+		Name:  name,
+		Type:  p.readUint16(),
+		Class: p.readUint16(),
+		TTL:   p.readUint32(),
+	}
+
+	rdlen := p.readUint16()
+
+	if p.off+int(rdlen) > len(p.data) {
+		return nil, fmt.Errorf("truncated rdata")
+	}
+
+	rr.RData = p.data[p.off : p.off+int(rdlen)]
+	p.off += int(rdlen)
+	return rr, nil
+}
+
+func (p *parser) readName() (string, error) {
+	var labels []string
+
+	start := p.off
+	jumped := false
+
+	for {
+		if p.off >= len(p.data) {
+			return "", fmt.Errorf("name out of range")
+		}
+		length := int(p.data[p.off])
+		p.off++
+
+		if length&0xC0 == 0xC0 {
+			if p.off >= len(p.data) {
+				return "", fmt.Errorf("truncated pointer")
+			}
+			ptr := ((length & 0x3F) << 8) | int(p.data[p.off])
+			p.off++
+
+			sub := &parser{data: p.data, off: ptr}
+			name, err := sub.readName()
+			if err != nil {
+				return "", err
+			}
+			labels = append(labels, name)
+
+			if !jumped {
+				start = p.off
+			}
+			jumped = true
+			break
+		}
+		if length == 0 {
+			break // terminator case
+		}
+
+		if p.off+length > len(p.data) {
+			return "", fmt.Errorf("truncate label")
+		}
+		label := string(p.data[p.off : p.off+length])
+		p.off += length
+		labels = append(labels, label)
+	}
+
+	if jumped {
+		p.off = start
+	}
+
+	return strings.Join(labels, "."), nil
+
+}
 
 func main() {
 	fmt.Println("Logs from your program will appear here!")
